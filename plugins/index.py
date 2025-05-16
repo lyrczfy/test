@@ -17,8 +17,7 @@ logger.setLevel(logging.INFO)
 lock = asyncio.Lock()
 
 # Configuration for rate limiting and batching
-BATCH_SIZE = 100  # Process messages in batches
-MAX_TASKS = 5     # Number of parallel tasks
+BATCH_SIZE = 100  # Process messages in batches (can be increased for efficiency)
 RATE_LIMIT = 0.5  # Seconds between batches to avoid FloodWait
 
 # For tracking progress
@@ -214,37 +213,38 @@ async def process_message(message, stats):
         return False
 
 
-async def process_batch(bot, chat, message_ids, stats, semaphore):
-    """Process a batch of message IDs with rate limiting and error handling"""
-    async with semaphore:
-        try:
-            # Get messages in batch to maintain original order
-            messages = await bot.get_messages(chat, message_ids)
+async def process_single_batch(bot, chat, message_ids, stats):
+    """Process a single batch of messages in strict order"""
+    try:
+        # Get messages in batch (this preserves order by message_id)
+        messages = await bot.get_messages(chat, message_ids)
+        
+        # Process each message in strict order
+        for i, message in enumerate(messages):
+            if stats.is_cancelled:
+                return
             
-            # Sort messages by ID to ensure proper order
-            sorted_messages = sorted(messages, key=lambda m: m.id if m and not m.empty else 0)
+            # Process the message
+            await process_message(message, stats)
+            stats.processed += 1
             
-            for message in sorted_messages:
-                if stats.is_cancelled:
-                    return
-                
-                # Process each message
-                await process_message(message, stats)
-                stats.processed += 1
-                
-            # Add rate limiting to avoid FloodWait
-            await asyncio.sleep(RATE_LIMIT)
-            
-        except FloodWait as e:
-            # Handle rate limiting by waiting the required time
-            logger.warning(f"FloodWait: Sleeping for {e.value} seconds")
-            await asyncio.sleep(e.value)
-            # Retry processing the same batch
-            await process_batch(bot, chat, message_ids, stats, semaphore)
-        except Exception as e:
-            logger.error(f"Error processing batch: {e}")
-            stats.errors += len(message_ids)
-            stats.processed += len(message_ids)
+            # Add a tiny pause every 20 messages to reduce FloodWait risk
+            if i > 0 and i % 20 == 0:
+                await asyncio.sleep(0.2)
+        
+        # Add small delay between batches to avoid FloodWait
+        await asyncio.sleep(RATE_LIMIT)
+        
+    except FloodWait as e:
+        # Handle rate limiting by waiting the required time
+        logger.warning(f"FloodWait: Sleeping for {e.value} seconds")
+        await asyncio.sleep(e.value)
+        # Retry processing the same batch
+        await process_single_batch(bot, chat, message_ids, stats)
+    except Exception as e:
+        logger.error(f"Error processing batch: {e}")
+        stats.errors += len(message_ids)
+        stats.processed += len(message_ids)
 
 
 async def update_status(msg, stats):
@@ -261,7 +261,7 @@ async def update_status(msg, stats):
 
 
 async def batch_index_files(lst_msg_id, chat, msg, bot):
-    """Index files in batches with parallel processing while maintaining order"""
+    """Index files strictly in sequential order with optimized batch processing"""
     stats = IndexStats()
     stats.start()
     temp.CANCEL = False
@@ -271,7 +271,7 @@ async def batch_index_files(lst_msg_id, chat, msg, bot):
             start_id = temp.CURRENT
             end_id = lst_msg_id
             
-            # Get all message IDs to process
+            # Get all message IDs to process (in strict order)
             message_ids = list(range(start_id, end_id + 1))
             total_messages = len(message_ids)
             
@@ -279,65 +279,25 @@ async def batch_index_files(lst_msg_id, chat, msg, bot):
             update_interval = max(min(total_messages // 10, 50), 1)  # Update at most 10 times, min every 50 messages
             last_update = 0
             
-            # Create batches
+            # Create batches while preserving order
             batches = [message_ids[i:i + BATCH_SIZE] for i in range(0, len(message_ids), BATCH_SIZE)]
             
-            # Create a semaphore to limit concurrent tasks
-            semaphore = asyncio.Semaphore(MAX_TASKS)
-            
-            # Process batches in order using a queue system
-            completed = 0
-            total_batches = len(batches)
-            batch_index = 0
-            active_tasks = {}
-            
-            # Initial status update
-            await update_status(msg, stats)
-            
-            # Process batches in order, maintaining a window of active tasks
-            while batch_index < total_batches or active_tasks:
-                # Start new tasks up to MAX_TASKS limit
-                while batch_index < total_batches and len(active_tasks) < MAX_TASKS and not temp.CANCEL:
-                    batch = batches[batch_index]
-                    task = asyncio.create_task(process_batch(bot, chat, batch, stats, semaphore))
-                    active_tasks[batch_index] = task
-                    batch_index += 1
-                
-                if not active_tasks:
+            # Process each batch strictly in order (no parallel processing)
+            for batch_idx, batch in enumerate(batches):
+                if temp.CANCEL:
+                    stats.is_cancelled = True
                     break
-                    
-                # Wait for any task to complete (don't wait for a specific one)
-                done, _ = await asyncio.wait(
-                    list(active_tasks.values()), 
-                    return_when=asyncio.FIRST_COMPLETED
-                )
                 
-                # Process completed tasks in order
-                newly_completed = []
-                for task in done:
-                    # Find which batch this task belongs to
-                    for idx, t in active_tasks.items():
-                        if t == task:
-                            newly_completed.append(idx)
-                            break
-                
-                # Remove completed tasks
-                for idx in newly_completed:
-                    active_tasks.pop(idx)
-                    completed += 1
+                # Process one batch at a time to maintain strict order
+                await process_single_batch(bot, chat, batch, stats)
                 
                 # Update status periodically
                 if stats.processed - last_update >= update_interval:
                     last_update = stats.processed
                     await update_status(msg, stats)
-                
-                # Check for cancellation
-                if temp.CANCEL:
-                    stats.is_cancelled = True
-                    # Cancel all remaining tasks
-                    for task in active_tasks.values():
-                        task.cancel()
-                    break
+                    
+                    # Small yield to allow other tasks to run (UI updates, etc.)
+                    await asyncio.sleep(0.01)
             
             # Final status update
             if stats.is_cancelled:
