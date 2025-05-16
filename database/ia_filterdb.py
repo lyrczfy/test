@@ -44,8 +44,6 @@ async def save_file(media):
         cleaned_caption = re.sub(r'(@|➧|https?://|~|➢|➪)\S*', '', media.caption.html)
         
         # Step 2: Preserve functional emojis and metadata while removing decorations
-        # Allowed: Letters, numbers, basic punctuation, and these emojis:
-        # 🗃⚖️🎬⏳🔊💬📀🎢📁🔍✅🎙🎞📺
         cleaned_caption = re.sub(
             r'[^\w\s\-.,!?🗃⚖️🎬⏳🔊💬📀🎢📁🔍✅🎙🎞📺]',
             '',  
@@ -81,6 +79,25 @@ async def save_file(media):
         else:
             logger.info(f'{getattr(media, "file_name", "NO_FILE")} is saved to database')
             return True, 1
+
+
+async def get_bad_files(limit=100):
+    """Get list of problematic files that might need attention"""
+    filter = {
+        '$or': [
+            {'file_name': {'$exists': False}},
+            {'file_size': {'$exists': False}},
+            {'file_type': {'$exists': False}},
+            {'mime_type': {'$exists': False}}
+        ]
+    }
+    
+    cursor = Media.find(filter)
+    cursor.sort('$natural', -1)
+    cursor.limit(limit)
+    
+    files = await cursor.to_list(length=limit)
+    return files
 
 
 async def get_search_results(query, file_type=None, max_results=10, offset=0, filter=False):
