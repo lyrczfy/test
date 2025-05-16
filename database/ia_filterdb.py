@@ -12,7 +12,6 @@ from info import DATABASE_URI, DATABASE_NAME, COLLECTION_NAME, USE_CAPTION_FILTE
 logger = logging.getLogger(__name__)
 logger.setLevel(logging.INFO)
 
-
 client = AsyncIOMotorClient(DATABASE_URI)
 db = client[DATABASE_NAME]
 instance = Instance.from_db(db)
@@ -33,11 +32,33 @@ class Media(Document):
 
 
 async def save_file(media):
-    """Save file in database"""
-
-    # TODO: Find better way to get same file_id for same media to avoid duplicates
+    """Save file in database after cleaning caption while preserving functional emojis and metadata"""
+    
     file_id, file_ref = unpack_new_file_id(media.file_id)
     file_name = re.sub(r"(_|\-|\.|\+)", " ", str(media.file_name))
+    
+    # Clean caption if it exists
+    caption = None
+    if media.caption:
+        # Step 1: Remove usernames, URLs, and decorative elements
+        cleaned_caption = re.sub(r'(@|➧|https?://|~|➢|➪)\S*', '', media.caption.html)
+        
+        # Step 2: Preserve functional emojis and metadata while removing decorations
+        # Allowed: Letters, numbers, basic punctuation, and these emojis:
+        # 🗃⚖️🎬⏳🔊💬📀🎢📁🔍✅🎙🎞📺
+        cleaned_caption = re.sub(
+            r'[^\w\s\-.,!?🗃⚖️🎬⏳🔊💬📀🎢📁🔍✅🎙🎞📺]',
+            '',  
+            cleaned_caption
+        )
+        
+        # Step 3: Normalize spaces and trim
+        caption = '\n'.join(
+            ' '.join(line.split())
+            for line in cleaned_caption.split('\n')
+            if line.strip()
+        ).strip()
+    
     try:
         file = Media(
             file_id=file_id,
@@ -46,7 +67,7 @@ async def save_file(media):
             file_size=media.file_size,
             file_type=media.file_type,
             mime_type=media.mime_type,
-            caption=media.caption.html if media.caption else None,
+            caption=caption if caption else None,
         )
     except ValidationError:
         logger.exception('Error occurred while saving file in database')
@@ -55,25 +76,17 @@ async def save_file(media):
         try:
             await file.commit()
         except DuplicateKeyError:      
-            logger.warning(
-                f'{getattr(media, "file_name", "NO_FILE")} is already saved in database'
-            )
-
+            logger.warning(f'{getattr(media, "file_name", "NO_FILE")} is already saved in database')
             return False, 0
         else:
             logger.info(f'{getattr(media, "file_name", "NO_FILE")} is saved to database')
             return True, 1
 
 
-
 async def get_search_results(query, file_type=None, max_results=10, offset=0, filter=False):
     """For given query return (results, next_offset)"""
 
     query = query.strip()
-    #if filter:
-        #better ?
-        #query = query.replace(' ', r'(\s|\.|\+|\-|_)')
-        #raw_pattern = r'(\s|_|\-|\.|\+)' + query + r'(\s|_|\-|\.|\+)'
     if not query:
         raw_pattern = '.'
     elif ' ' not in query:
@@ -110,44 +123,6 @@ async def get_search_results(query, file_type=None, max_results=10, offset=0, fi
 
     return files, next_offset, total_results
 
-
-async def get_bad_files(query, file_type=None, filter=False):
-    """For given query return (results, next_offset)"""
-    query = query.strip()
-    #if filter:
-        #better ?
-        #query = query.replace(' ', r'(\s|\.|\+|\-|_)')
-        #raw_pattern = r'(\s|_|\-|\.|\+)' + query + r'(\s|_|\-|\.|\+)'
-    if not query:
-        raw_pattern = '.'
-    elif ' ' not in query:
-        raw_pattern = r'(\b|[\.\+\-_])' + query + r'(\b|[\.\+\-_])'
-    else:
-        raw_pattern = query.replace(' ', r'.*[\s\.\+\-_]')
-    
-    try:
-        regex = re.compile(raw_pattern, flags=re.IGNORECASE)
-    except:
-        return []
-
-    if USE_CAPTION_FILTER:
-        filter = {'$or': [{'file_name': regex}, {'caption': regex}]}
-    else:
-        filter = {'file_name': regex}
-
-    if file_type:
-        filter['file_type'] = file_type
-
-    total_results = await Media.count_documents(filter)
-
-    cursor = Media.find(filter)
-    # Sort by recent
-    cursor.sort('$natural', -1)
-    # Get list of files
-    files = await cursor.to_list(length=total_results)
-
-    return files, total_results
-    
 
 async def get_file_details(query):
     filter = {'file_id': query}
