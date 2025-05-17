@@ -17,7 +17,7 @@ logger.setLevel(logging.INFO)
 lock = asyncio.Lock()
 
 # Configuration for rate limiting and batching
-BATCH_SIZE = 100  # Process messages in batches (can be increased for efficiency)
+BATCH_SIZE = 200  # Process messages in batches (can be increased for efficiency)
 RATE_LIMIT = 0.5  # Seconds between batches to avoid FloodWait
 
 # For tracking progress
